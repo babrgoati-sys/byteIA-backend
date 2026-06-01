@@ -1,102 +1,172 @@
 const express = require('express');
 const cors = require('cors');
+const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
+
 const app = express();
-
-app.use(express.json({ limit: '10mb' }));
-app.use(cors({ origin: '*' }));
-
-// ── Providers ──
-const PROVIDERS = [
-  { id:'groq',        url:'https://api.groq.com/openai/v1/chat/completions',                             key:()=>process.env.GROQ_API_KEY,        model:'llama-3.3-70b-versatile' },
-  { id:'gemini',      url:'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',    key:()=>process.env.GEMINI_API_KEY,      model:'gemini-2.5-flash' },
-  { id:'cerebras',    url:'https://api.cerebras.ai/v1/chat/completions',                                 key:()=>process.env.CEREBRAS_API_KEY,    model:'llama-3.3-70b' },
-  { id:'openrouter',  url:'https://openrouter.ai/api/v1/chat/completions',                               key:()=>process.env.OPENROUTER_API_KEY,  model:'meta-llama/llama-3.3-70b-instruct:free' },
-  { id:'sambanova',   url:'https://api.sambanova.ai/v1/chat/completions',                                key:()=>process.env.SAMBANOVA_API_KEY,   model:'Meta-Llama-3.3-70B-Instruct' },
-  { id:'mistral',     url:'https://api.mistral.ai/v1/chat/completions',                                  key:()=>process.env.MISTRAL_API_KEY,     model:'mistral-small-latest' },
-  { id:'huggingface', url:'https://api-inference.huggingface.co/v1/chat/completions',                    key:()=>process.env.HUGGINGFACE_API_KEY, model:'meta-llama/Llama-3.3-70B-Instruct' },
-  { id:'nvidia',      url:'https://integrate.api.nvidia.com/v1/chat/completions',                        key:()=>process.env.NVIDIA_API_KEY,      model:'meta/llama-3.3-70b-instruct' },
-  { id:'github',      url:'https://models.inference.ai.azure.com/chat/completions',                      key:()=>process.env.GITHUB_API_KEY,      model:'gpt-4o' },
-  { id:'cloudflare',  url:null,                                                                           key:()=>process.env.CLOUDFLARE_TOKEN,   model:'@cf/meta/llama-3.3-70b-instruct-fp8-fast', accountId:()=>process.env.CLOUDFLARE_ACCOUNT_ID },
-  { id:'venice',      url:'https://api.venice.ai/api/v1/chat/completions',                               key:()=>process.env.VENICE_API_KEY,      model:'llama-3.3-70b' },
-  { id:'moonshot',    url:'https://api.moonshot.cn/v1/chat/completions',                                 key:()=>process.env.MOONSHOT_API_KEY,    model:'moonshot-v1-8k' },
-  { id:'minimax',     url:'https://api.minimax.chat/v1/text/chatcompletion_pro',                         key:()=>process.env.MINIMAX_API_KEY,     model:'abab6.5s-chat' },
-  { id:'together',    url:'https://api.together.xyz/v1/chat/completions',                                key:()=>process.env.TOGETHER_API_KEY,    model:'meta-llama/Llama-3.3-70B-Instruct-Turbo-Free' },
-];
-
-// ── Health ──
-app.get('/', (req, res) => {
-  const active = PROVIDERS.filter(p => p.key()).map(p => p.id);
-  res.json({ status:'ok', name:'Byte IA Backend', providers:active.length, active });
-});
-
-// ── Chat ──
-app.post('/v1/chat/completions', async (req, res) => {
-  const { messages, model: reqModel, temperature=0.7, max_tokens=2048, stream=false } = req.body;
-  if (!messages?.length) return res.status(400).json({ error:{message:'messages requis'} });
-
-  const active = PROVIDERS.filter(p => p.key());
-  if (!active.length) return res.status(503).json({ error:{message:'Aucun fournisseur configuré'} });
-
-  let lastError = '';
-
-  for (const p of active) {
-    try {
-      const key = p.key();
-      const model = (reqModel && reqModel !== 'auto') ? reqModel : p.model;
-      let url = p.url;
-
-      if (p.id === 'cloudflare') {
-        const accountId = p.accountId();
-        if (!accountId) { lastError='Cloudflare: ACCOUNT_ID manquant'; continue; }
-        url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1/chat/completions`;
-      }
-
-      const upstream = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type':'application/json', 'Authorization':`Bearer ${key}` },
-        body: JSON.stringify({ model, messages, temperature, max_tokens, stream }),
-        signal: AbortSignal.timeout(30000),
-      });
-
-      if (upstream.status === 429) { lastError=`${p.id}: quota atteint`; continue; }
-      if (!upstream.ok) {
-        const e = await upstream.json().catch(()=>({}));
-        lastError = `${p.id}: ${e.error?.message||upstream.status}`;
-        continue;
-      }
-
-      // ── Streaming: pipe SSE directly ──
-      if (stream) {
-        res.setHeader('Content-Type','text/event-stream');
-        res.setHeader('Cache-Control','no-cache');
-        res.setHeader('X-Routed-Via', `${p.id}/${model}`);
-
-        // Send provider info as first chunk
-        res.write(`data: ${JSON.stringify({_provider:p.id,_model:model,choices:[{delta:{content:''},index:0}]})}\n\n`);
-
-        const reader = upstream.body.getReader();
-        const decoder = new TextDecoder();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          res.write(decoder.decode(value));
-        }
-                res.end();
-                return;
-      }
-
-          // Non-streaming
-          const data = await upstream.json();
-            res.setHeader('X-Routed-Via', `${p.id}/${model}`);
-            return res.json(data);
-
-    } catch (err) {
-            lastError = `${p.id}: ${err.message}`;
-    }
-  }
-
-           res.status(502).json({ error:{ message:`Tous les fournisseurs ont echoue. Dernier: ${lastError}` } });
-});
+app.use(cors());
+app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Byte IA Backend demarre sur le port ${PORT}`));
+
+// Provider configurations
+const providers = {
+  groq: {
+    name: 'Groq',
+    url: 'https://api.groq.com/openai/v1/chat/completions',
+    key: process.env.GROQ_API_KEY,
+    models: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768']
+  },
+  openrouter: {
+    name: 'OpenRouter',
+    url: 'https://openrouter.ai/api/v1/chat/completions',
+    key: process.env.OPENROUTER_API_KEY,
+    models: ['meta-llama/llama-3.3-70b-instruct:free', 'google/gemma-3-27b-it:free', 'deepseek/deepseek-r1:free']
+  },
+  together: {
+    name: 'Together',
+    url: 'https://api.together.xyz/v1/chat/completions',
+    key: process.env.TOGETHER_API_KEY,
+    models: ['meta-llama/Llama-3.3-70B-Instruct-Turbo-Free']
+  },
+  mistral: {
+    name: 'Mistral',
+    url: 'https://api.mistral.ai/v1/chat/completions',
+    key: process.env.MISTRAL_API_KEY,
+    models: ['mistral-small-latest', 'mistral-large-latest']
+  },
+  cohere: {
+    name: 'Cohere',
+    url: 'https://api.cohere.ai/v2/chat',
+    key: process.env.COHERE_API_KEY,
+    models: ['command-r-plus']
+  }
+};
+
+// Health check
+app.get('/', (req, res) => {
+  const active = Object.entries(providers)
+    .filter(([, p]) => p.key)
+    .map(([id, p]) => ({ id, name: p.name, models: p.models }));
+  res.json({ status: 'ok', providers: active });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
+// Get available providers
+app.get('/providers', (req, res) => {
+  const active = Object.entries(providers)
+    .filter(([, p]) => p.key)
+    .map(([id, p]) => ({ id, name: p.name, models: p.models }));
+  res.json(active);
+});
+
+// Chat endpoint (non-streaming)
+app.post('/chat', async (req, res) => {
+  const { provider = 'groq', model, messages, temperature = 0.7, max_tokens = 1024 } = req.body;
+
+  const prov = providers[provider];
+  if (!prov) return res.status(400).json({ error: 'Unknown provider: ' + provider });
+  if (!prov.key) return res.status(400).json({ error: 'Provider not configured: ' + provider });
+
+  const selectedModel = model || prov.models[0];
+
+  try {
+    const response = await fetch(prov.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${prov.key}`,
+        ...(provider === 'openrouter' ? {
+          'HTTP-Referer': 'https://byteia-backend.onrender.com',
+          'X-Title': 'Byte IA'
+        } : {})
+      },
+      body: JSON.stringify({ model: selectedModel, messages, temperature, max_tokens })
+    });
+
+    const data = await response.json();
+    if (!response.ok) return res.status(response.status).json(data);
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Streaming chat endpoint
+app.post('/chat/stream', async (req, res) => {
+  const { provider = 'groq', model, messages, temperature = 0.7, max_tokens = 2048 } = req.body;
+
+  const prov = providers[provider];
+  if (!prov) return res.status(400).json({ error: 'Unknown provider: ' + provider });
+  if (!prov.key) return res.status(400).json({ error: 'Provider not configured: ' + provider });
+
+  const selectedModel = model || prov.models[0];
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  try {
+    const response = await fetch(prov.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${prov.key}`,
+        ...(provider === 'openrouter' ? {
+          'HTTP-Referer': 'https://byteia-backend.onrender.com',
+          'X-Title': 'Byte IA'
+        } : {})
+      },
+      body: JSON.stringify({ model: selectedModel, messages, temperature, max_tokens, stream: true })
+    });
+
+    if (!response.ok) {
+      const err = await response.json();
+      res.write(`data: ${JSON.stringify({ error: err })}\n\n`);
+      res.end();
+      return;
+    }
+
+    for await (const chunk of response.body) {
+      const text = chunk.toString();
+      const lines = text.split('\n').filter(l => l.trim());
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          res.write(line + '\n\n');
+        }
+      }
+    }
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch (err) {
+    res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+    res.end();
+  }
+});
+
+// Image generation endpoint
+app.post('/image', async (req, res) => {
+  const { prompt, model = 'dall-e-3', size = '1024x1024', n = 1 } = req.body;
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return res.status(400).json({ error: 'OpenAI not configured' });
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/images/generations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+      body: JSON.stringify({ prompt, model, size, n })
+    });
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`ByteIA backend running on port ${PORT}`);
+  const active = Object.entries(providers).filter(([, p]) => p.key).map(([id]) => id);
+  console.log('Active providers:', active.join(', ') || 'none');
+});
