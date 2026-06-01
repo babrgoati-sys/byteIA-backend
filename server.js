@@ -79,4 +79,24 @@ app.post('/v1/chat/completions', async (req, res) => {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          res.write(d
+          res.write(decoder.decode(value));
+        }
+                res.end();
+                return;
+      }
+
+          // Non-streaming
+          const data = await upstream.json();
+            res.setHeader('X-Routed-Via', `${p.id}/${model}`);
+            return res.json(data);
+
+    } catch (err) {
+            lastError = `${p.id}: ${err.message}`;
+    }
+  }
+
+           res.status(502).json({ error:{ message:`Tous les fournisseurs ont echoue. Dernier: ${lastError}` } });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Byte IA Backend demarre sur le port ${PORT}`));
