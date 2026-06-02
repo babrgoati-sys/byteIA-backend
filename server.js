@@ -94,7 +94,7 @@ app.post('/chat/stream', async (req, res) => {
 // Music generation via HuggingFace MusicGen
 app.post('/music', async (req, res) => {
   const { prompt = 'upbeat happy music', duration = 10 } = req.body;
-  const key = process.env.HF_API_KEY;
+  const key = process.env.HUGGINGFACE_API_KEY || process.env.HF_API_KEY;
   if (!key) return res.status(400).json({ error: 'HF_API_KEY not configured' });
   try {
     const response = await fetch('https://api-inference.huggingface.co/models/facebook/musicgen-small', {
