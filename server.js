@@ -90,6 +90,31 @@ app.post('/chat/stream', async (req, res) => {
   }
 });
 
+
+// Music generation via HuggingFace MusicGen
+app.post('/music', async (req, res) => {
+  const { prompt = 'upbeat happy music', duration = 10 } = req.body;
+  const key = process.env.HF_API_KEY;
+  if (!key) return res.status(400).json({ error: 'HF_API_KEY not configured' });
+  try {
+    const response = await fetch('https://api-inference.huggingface.co/models/facebook/musicgen-small', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inputs: prompt })
+    });
+    if (!response.ok) {
+      const err = await response.text();
+      return res.status(response.status).json({ error: err });
+    }
+    const audioBuffer = await response.arrayBuffer();
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Content-Disposition', 'inline; filename="music.wav"');
+    res.send(Buffer.from(audioBuffer));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log('ByteIA backend running on port ' + PORT);
   const active = Object.entries(providers).filter(([,p]) => p.key).map(([id]) => id);
