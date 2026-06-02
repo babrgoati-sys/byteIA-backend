@@ -4,119 +4,237 @@ const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 3000;
 
-const providers = {
-  groq: { name: 'Groq', url: 'https://api.groq.com/openai/v1/chat/completions', key: process.env.GROQ_API_KEY, models: ['llama-3.3-70b-versatile','llama-3.1-8b-instant'] },
-  openrouter: { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', key: process.env.OPENROUTER_API_KEY, models: ['meta-llama/llama-3.3-70b-instruct:free','google/gemma-3-27b-it:free'] },
-  together: { name: 'Together', url: 'https://api.together.xyz/v1/chat/completions', key: process.env.TOGETHER_API_KEY, models: ['meta-llama/Llama-3.3-70B-Instruct-Turbo-Free'] },
-  mistral: { name: 'Mistral', url: 'https://api.mistral.ai/v1/chat/completions', key: process.env.MISTRAL_API_KEY, models: ['mistral-small-latest','mistral-large-latest'] },
-  cohere: { name: 'Cohere', url: 'https://api.cohere.ai/v2/chat', key: process.env.COHERE_API_KEY, models: ['command-r-plus'] }
+// ---- PROVIDERS CONFIG ----
+const PROVIDERS = {
+  groq: {
+    key: process.env.GROQ_API_KEY,
+    url: 'https://api.groq.com/openai/v1/chat/completions',
+    model: 'llama3-8b-8192',
+    type: 'openai'
+  },
+  openrouter: {
+    key: process.env.OPENROUTER_API_KEY,
+    url: 'https://openrouter.ai/api/v1/chat/completions',
+    model: 'mistralai/mistral-7b-instruct',
+    type: 'openai'
+  },
+  mistral: {
+    key: process.env.MISTRAL_API_KEY,
+    url: 'https://api.mistral.ai/v1/chat/completions',
+    model: 'mistral-small-latest',
+    type: 'openai'
+  },
+  gemini: {
+    key: process.env.GEMINI_API_KEY,
+    model: 'gemini-2.0-flash',
+    type: 'gemini'
+  },
+  together: {
+    key: process.env.TOGETHER_API_KEY,
+    url: 'https://api.together.xyz/v1/chat/completions',
+    model: 'mistralai/Mistral-7B-Instruct-v0.1',
+    type: 'openai'
+  }
 };
 
+// ---- STATUS ----
 app.get('/', (req, res) => {
-  const active = Object.entries(providers).filter(([,p]) => p.key).map(([id,p]) => ({ id, name: p.name, models: p.models }));
+  const active = Object.entries(PROVIDERS)
+    .filter(([, v]) => v.key)
+    .map(([k]) => k);
   res.json({ status: 'ok', providers: active });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+// ---- CHAT ----
+app.post('/api/chat', async (req, res) => {
+  const { message, model = 'groq', history = [], imageData } = req.body;
+  if (!message) return res.status(400).json({ error: 'message requis' });
 
-app.get('/providers', (req, res) => {
-  const active = Object.entries(providers).filter(([,p]) => p.key).map(([id,p]) => ({ id, name: p.name, models: p.models }));
-  res.json(active);
-});
+  const provider = PROVIDERS[model] || PROVIDERS.groq;
 
-app.post('/chat', async (req, res) => {
-  const { provider = 'groq', model, messages, temperature = 0.7, max_tokens = 1024 } = req.body;
-  const prov = providers[provider];
-  if (!prov) return res.status(400).json({ error: 'Unknown provider: ' + provider });
-  if (!prov.key) return res.status(400).json({ error: 'Provider not configured: ' + provider });
-  const selectedModel = model || prov.models[0];
-  try {
-    const response = await fetch(prov.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + prov.key,
-        ...(provider === 'openrouter' ? { 'HTTP-Referer': 'https://byteia-backend.onrender.com', 'X-Title': 'Byte IA' } : {})
-      },
-      body: JSON.stringify({ model: selectedModel, messages, temperature, max_tokens })
-    });
-    const data = await response.json();
-    if (!response.ok) return res.status(response.status).json(data);
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  // Fallback si la clé manque
+  let chosen = provider;
+  if (!chosen.key) {
+    chosen = Object.values(PROVIDERS).find(p => p.key);
+    if (!chosen) return res.status(503).json({ error: 'Aucune clé API disponible.' });
   }
-});
 
-app.post('/chat/stream', async (req, res) => {
-  const { provider = 'groq', model, messages, temperature = 0.7, max_tokens = 2048 } = req.body;
-  const prov = providers[provider];
-  if (!prov) return res.status(400).json({ error: 'Unknown provider: ' + provider });
-  if (!prov.key) return res.status(400).json({ error: 'Provider not configured: ' + provider });
-  const selectedModel = model || prov.models[0];
+  const messages = [
+    { role: 'system', content: 'Tu es Byte IA, un assistant intelligent, amical et concis. Réponds toujours en français sauf si l\'utilisateur écrit dans une autre langue. Ne mets jamais d\'astérisques ni de symboles markdown dans tes réponses.' },
+    ...history,
+    { role: 'user', content: message }
+  ];
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+
   try {
-    const response = await fetch(prov.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + prov.key,
-        ...(provider === 'openrouter' ? { 'HTTP-Referer': 'https://byteia-backend.onrender.com', 'X-Title': 'Byte IA' } : {})
-      },
-      body: JSON.stringify({ model: selectedModel, messages, temperature, max_tokens, stream: true })
-    });
-    if (!response.ok) {
-      const err = await response.json();
-      res.write('data: ' + JSON.stringify({ error: err }) + '\n\n');
-      res.end(); return;
+    if (chosen.type === 'gemini') {
+      await streamGemini(chosen, messages, res);
+    } else {
+      await streamOpenAI(chosen, messages, res);
     }
-    for await (const chunk of response.body) {
-      const lines = chunk.toString().split('\n').filter(l => l.trim());
-      for (const line of lines) {
-        if (line.startsWith('data: ')) res.write(line + '\n\n');
-      }
-    }
+  } catch (e) {
+    res.write(`data: ${JSON.stringify({ text: 'Erreur: ' + e.message })}\n\n`);
     res.write('data: [DONE]\n\n');
     res.end();
-  } catch (err) {
-    res.write('data: ' + JSON.stringify({ error: err.message }) + '\n\n');
+  }
+});
+
+async function streamOpenAI(provider, messages, res) {
+  const r = await fetch(provider.url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${provider.key}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ model: provider.model, messages, stream: true })
+  });
+
+  if (!r.ok) {
+    const err = await r.text();
+    res.write(`data: ${JSON.stringify({ text: 'Erreur provider: ' + err.slice(0, 100) })}\n\n`);
+    res.write('data: [DONE]\n\n');
     res.end();
+    return;
   }
-});
 
-
-// Music generation via HuggingFace MusicGen
-app.post('/music', async (req, res) => {
-  const { prompt = 'upbeat happy music', duration = 10 } = req.body;
-  const key = process.env.HUGGINGFACE_API_KEY || process.env.HF_API_KEY;
-  if (!key) return res.status(400).json({ error: 'HF_API_KEY not configured' });
-  try {
-    const response = await fetch('https://api-inference.huggingface.co/models/facebook/musicgen-small', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ inputs: prompt })
-    });
-    if (!response.ok) {
-      const err = await response.text();
-      return res.status(response.status).json({ error: err });
+  const decoder = new (require('string_decoder').StringDecoder)('utf8');
+  r.body.on('data', (chunk) => {
+    const text = decoder.write(chunk);
+    const lines = text.split('\n');
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const d = line.slice(6).trim();
+      if (d === '[DONE]') { res.write('data: [DONE]\n\n'); return; }
+      try {
+        const j = JSON.parse(d);
+        const t = j.choices?.[0]?.delta?.content;
+        if (t) res.write(`data: ${JSON.stringify({ text: t })}\n\n`);
+      } catch (_) {}
     }
-    const audioBuffer = await response.arrayBuffer();
-    res.setHeader('Content-Type', 'audio/wav');
-    res.setHeader('Content-Disposition', 'inline; filename="music.wav"');
-    res.send(Buffer.from(audioBuffer));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  });
+  r.body.on('end', () => { res.write('data: [DONE]\n\n'); res.end(); });
+  r.body.on('error', (e) => { res.write(`data: ${JSON.stringify({ text: e.message })}\n\n`); res.write('data: [DONE]\n\n'); res.end(); });
+}
+
+async function streamGemini(provider, messages, res) {
+  const contents = messages
+    .filter(m => m.role !== 'system')
+    .map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }));
+
+  const systemMsg = messages.find(m => m.role === 'system');
+
+  const body = {
+    contents,
+    generationConfig: { temperature: 0.7 }
+  };
+  if (systemMsg) body.systemInstruction = { parts: [{ text: systemMsg.content }] };
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${provider.model}:streamGenerateContent?alt=sse&key=${provider.key}`;
+
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  if (!r.ok) {
+    const err = await r.text();
+    res.write(`data: ${JSON.stringify({ text: 'Erreur Gemini: ' + err.slice(0, 150) })}\n\n`);
+    res.write('data: [DONE]\n\n');
+    res.end();
+    return;
+  }
+
+  const decoder = new (require('string_decoder').StringDecoder)('utf8');
+  r.body.on('data', (chunk) => {
+    const text = decoder.write(chunk);
+    const lines = text.split('\n');
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const d = line.slice(6).trim();
+      try {
+        const j = JSON.parse(d);
+        const t = j.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (t) res.write(`data: ${JSON.stringify({ text: t })}\n\n`);
+      } catch (_) {}
+    }
+  });
+  r.body.on('end', () => { res.write('data: [DONE]\n\n'); res.end(); });
+  r.body.on('error', (e) => { res.write(`data: ${JSON.stringify({ text: e.message })}\n\n`); res.write('data: [DONE]\n\n'); res.end(); });
+}
+
+// ---- IMAGE GENERATION ----
+app.post('/api/image', async (req, res) => {
+  const { prompt } = req.body;
+  if (!prompt) return res.status(400).json({ error: 'prompt requis' });
+
+  // Essai avec Pollinations (gratuit, sans clé)
+  try {
+    const encoded = encodeURIComponent(prompt);
+    const url = `https://image.pollinations.ai/prompt/${encoded}?width=512&height=512&nologo=true`;
+    // On vérifie juste que l'URL est accessible
+    const check = await fetch(url, { method: 'HEAD' });
+    if (check.ok || check.status === 200 || check.redirected) {
+      return res.json({ url });
+    }
+  } catch (_) {}
+
+  // Fallback: HuggingFace Stable Diffusion
+  const hfKey = process.env.HF_API_KEY || process.env.HUGGINGFACE_API_KEY;
+  if (hfKey) {
+    try {
+      const r = await fetch('https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${hfKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ inputs: prompt })
+      });
+      if (r.ok) {
+        const buf = await r.buffer();
+        const b64 = buf.toString('base64');
+        return res.json({ url: `data:image/png;base64,${b64}` });
+      }
+    } catch (_) {}
+  }
+
+  res.json({ error: 'Impossible de générer l\'image pour l\'instant.' });
+});
+
+// ---- MUSIC GENERATION ----
+app.post('/api/music', async (req, res) => {
+  const { prompt } = req.body;
+  if (!prompt) return res.status(400).json({ error: 'prompt requis' });
+
+  const hfKey = process.env.HF_API_KEY || process.env.HUGGINGFACE_API_KEY;
+  if (!hfKey) return res.json({ error: 'Clé HuggingFace manquante. Ajoutez HF_API_KEY dans Render.' });
+
+  try {
+    const r = await fetch('https://api-inference.huggingface.com/models/facebook/musicgen-small', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${hfKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inputs: prompt }),
+      timeout: 60000
+    });
+
+    if (!r.ok) {
+      const err = await r.text();
+      // Modèle en cours de chargement
+      if (r.status === 503) return res.json({ error: 'Le modèle musical se réveille (30-60s). Réessayez dans un moment.' });
+      return res.json({ error: 'Erreur HuggingFace: ' + err.slice(0, 100) });
+    }
+
+    const buf = await r.buffer();
+    const b64 = buf.toString('base64');
+    res.json({ url: `data:audio/wav;base64,${b64}` });
+  } catch (e) {
+    res.json({ error: 'Erreur génération musicale: ' + e.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log('ByteIA backend running on port ' + PORT);
-  const active = Object.entries(providers).filter(([,p]) => p.key).map(([id]) => id);
-  console.log('Active providers:', active.join(', ') || 'none');
-});
+app.listen(PORT, () => console.log(`Byte IA backend running on port ${PORT}`));
