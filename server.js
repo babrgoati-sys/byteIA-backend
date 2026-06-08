@@ -159,7 +159,10 @@ app.get('/admin/status', (req, res) => {
 
 // ---- CHAT ----
 app.post('/api/chat', async (req, res) => {
-  const { message, history = [], imageData, tier = DEFAULT_TIER, webSearch = false } = req.body;
+  const { message: rawMessage, history = [], imageData, tier = DEFAULT_TIER, webSearch = false } = req.body;
+  // Si une image est présente sans texte, on demande à l'IA de la décrire
+  let message = rawMessage;
+  if (!message && imageData) message = 'Décris ce que tu vois sur cette image.';
   if (!message) return res.status(400).json({ error: 'message requis' });
   const validTier = TIERS[tier] ? tier : DEFAULT_TIER;
 
@@ -217,6 +220,22 @@ Règles strictes :
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
+  // VISION : si une image est jointe, routage forcé vers Gemini (seul provider vision)
+  if (imageData && PROVIDERS.gemini && PROVIDERS.gemini.key) {
+    const geminiProvider = {
+      name: 'gemini',
+      tierKey: 'gemini:vision',
+      ...PROVIDERS.gemini,
+      model: 'gemini-2.0-flash'  // modèle vision rapide et gratuit
+    };
+    console.log('[chat] VISION mode → gemini');
+    const r = await tryProvider(geminiProvider, messages, res, imageData);
+    if (r.ok) return;
+    res.write(`data: ${JSON.stringify({ text: 'Désolé, l\'analyse d\'image n\'a pas marché. Réessayez.' })}\n\n`);
+    res.write('data: [DONE]\n\n');
+    return res.end();
+  }
+
   // Boucle de fallback : essaie chaque provider dans l'ordre du tier
   let attempted = [];
   while (true) {
@@ -255,15 +274,22 @@ Règles strictes :
 
 // Essaie un provider. Retourne { ok: true } si succès, sinon { ok: false, code, err }.
 // Important : n'écrit RIEN dans res tant qu'on n'a pas confirmé que le provider marche.
-async function tryProvider(chosen, messages, res) {
+async function tryProvider(chosen, messages, res, imageData = null) {
   try {
     if (chosen.type === 'gemini') {
-      return await streamGeminiSafe(chosen, messages, res);
+      return await streamGeminiSafe(chosen, messages, res, imageData);
     }
     return await streamOpenAISafe(chosen, messages, res);
   } catch (e) {
     return { ok: false, code: 0, err: e.message };
   }
+}
+
+// Parse une dataURL "data:image/jpeg;base64,XXX" => { mime, data }
+function parseDataUrl(dataUrl) {
+  const m = /^data:([^;,]+)(?:;base64)?,(.+)$/.exec(dataUrl || '');
+  if (!m) return null;
+  return { mime: m[1], data: m[2] };
 }
 
 async function streamOpenAISafe(provider, messages, res) {
@@ -305,10 +331,28 @@ async function streamOpenAISafe(provider, messages, res) {
   });
 }
 
-async function streamGeminiSafe(provider, messages, res) {
+async function streamGeminiSafe(provider, messages, res, imageData = null) {
   const contents = messages
     .filter(m => m.role !== 'system')
     .map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }));
+
+  // VISION : injecter l'image dans le dernier message user
+  if (imageData && contents.length > 0) {
+    const parsed = parseDataUrl(imageData);
+    if (parsed) {
+      const lastUserIdx = [...contents].reverse().findIndex(c => c.role === 'user');
+      if (lastUserIdx !== -1) {
+        const realIdx = contents.length - 1 - lastUserIdx;
+        // Si pas de texte explicite, ajouter un prompt par défaut
+        if (!contents[realIdx].parts[0].text || contents[realIdx].parts[0].text.trim() === '') {
+          contents[realIdx].parts[0].text = 'Décris ce que tu vois sur cette image.';
+        }
+        contents[realIdx].parts.push({
+          inline_data: { mime_type: parsed.mime, data: parsed.data }
+        });
+      }
+    }
+  }
 
   const systemMsg = messages.find(m => m.role === 'system');
   const body = { contents, generationConfig: { temperature: 0.7 } };
@@ -583,5 +627,119 @@ app.post('/api/music', async (req, res) => {
     res.json({ error: 'Erreur génération musicale: ' + (e.message || 'inconnue') });
   }
 });
+
+// ---- VERIFICATION EMAIL PAR CODE (signup email seulement) ----
+// Stockage en memoire : { email -> { code, expires, attempts, lastSent } }
+const emailCodes = {};
+const CODE_TTL = 10 * 60 * 1000;          // 10 minutes
+const CODE_RESEND_COOLDOWN = 60 * 1000;   // 1 min entre 2 envois
+const MAX_ATTEMPTS = 5;
+
+function generateCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));  // 6 chiffres
+}
+
+async function sendCodeEmail(email, code, lang = 'fr') {
+  const resendKey = process.env.RESEND_API_KEY;
+  if (!resendKey) {
+    console.log('[verify] RESEND_API_KEY manquante, code:', code);
+    return { ok: false, error: 'Service email non configure' };
+  }
+  const subjects = {
+    fr: 'Votre code de verification Byte IA',
+    en: 'Your Byte IA verification code',
+    es: 'Tu codigo de verificacion Byte IA',
+    it: 'Il tuo codice di verifica Byte IA',
+    de: 'Dein Byte IA Verifizierungscode',
+    pt: 'Seu codigo de verificacao Byte IA',
+    nl: 'Je Byte IA verificatiecode',
+    ar: 'رمز التحقق Byte IA'
+  };
+  const subj = subjects[lang] || subjects.fr;
+  const html = `
+    <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:auto;padding:30px 20px;background:#fafafa;border-radius:14px">
+      <div style="text-align:center;margin-bottom:24px">
+        <h1 style="margin:0;font-size:22px;color:#1a1a1a">Byte <span style="color:#6c7aff">IA</span></h1>
+      </div>
+      <p style="color:#1a1a1a;font-size:15px;line-height:1.5">Voici votre code de verification :</p>
+      <div style="background:#fff;border:2px solid #6c7aff;border-radius:12px;padding:20px;text-align:center;margin:20px 0">
+        <div style="font-size:36px;font-weight:700;letter-spacing:8px;color:#6c7aff;font-family:monospace">${code}</div>
+      </div>
+      <p style="color:#555;font-size:13px">Ce code expire dans 10 minutes. Si vous n'avez pas demande ce code, ignorez cet email.</p>
+      <p style="color:#999;font-size:11px;text-align:center;margin-top:30px">Byte IA &middot; Assistant intelligent</p>
+    </div>`;
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + resendKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Byte IA <onboarding@resend.dev>',
+        to: [email],
+        subject: subj,
+        html: html
+      })
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      return { ok: false, error: 'Erreur envoi : ' + err.slice(0, 100) };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// POST /api/auth/send-code { email, lang } => envoi du code
+app.post('/api/auth/send-code', async (req, res) => {
+  const { email, lang = 'fr' } = req.body;
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return res.status(400).json({ error: 'Email invalide' });
+  }
+  const now = Date.now();
+  const existing = emailCodes[email];
+  if (existing && (now - existing.lastSent) < CODE_RESEND_COOLDOWN) {
+    const wait = Math.ceil((CODE_RESEND_COOLDOWN - (now - existing.lastSent)) / 1000);
+    return res.status(429).json({ error: `Attendez ${wait}s avant un nouvel envoi` });
+  }
+  const code = generateCode();
+  emailCodes[email] = { code, expires: now + CODE_TTL, attempts: 0, lastSent: now };
+  const r = await sendCodeEmail(email, code, lang);
+  if (!r.ok) {
+    delete emailCodes[email];
+    return res.status(500).json({ error: r.error });
+  }
+  res.json({ ok: true, message: 'Code envoye' });
+});
+
+// POST /api/auth/verify-code { email, code } => verification du code
+app.post('/api/auth/verify-code', (req, res) => {
+  const { email, code } = req.body;
+  if (!email || !code) return res.status(400).json({ error: 'Email et code requis' });
+  const entry = emailCodes[email];
+  if (!entry) return res.status(400).json({ error: 'Aucun code en attente pour cet email' });
+  if (Date.now() > entry.expires) {
+    delete emailCodes[email];
+    return res.status(400).json({ error: 'Code expire, demandez-en un nouveau' });
+  }
+  entry.attempts++;
+  if (entry.attempts > MAX_ATTEMPTS) {
+    delete emailCodes[email];
+    return res.status(429).json({ error: 'Trop de tentatives, demandez un nouveau code' });
+  }
+  if (entry.code !== String(code).trim()) {
+    return res.status(400).json({ error: 'Code incorrect', attemptsLeft: MAX_ATTEMPTS - entry.attempts });
+  }
+  // Code valide : on le supprime (one-shot) et on emet un token court qui prouve la verification
+  delete emailCodes[email];
+  res.json({ ok: true, message: 'Email verifie' });
+});
+
+// Nettoyage periodique des codes expires
+setInterval(() => {
+  const now = Date.now();
+  for (const k of Object.keys(emailCodes)) {
+    if (now > emailCodes[k].expires + CODE_TTL) delete emailCodes[k];
+  }
+}, 5 * 60 * 1000);
 
 app.listen(PORT, () => console.log(`Byte IA backend running on port ${PORT}`));
