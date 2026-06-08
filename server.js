@@ -543,89 +543,164 @@ async function searchWeb(query, n = 5) {
 }
 
 // ---- IMAGE GENERATION ----
+// Modèles d'image à essayer dans l'ordre (gratuits, HF router)
+const IMAGE_MODELS = [
+  'black-forest-labs/FLUX.1-schnell',  // Top qualité, rapide
+  'stabilityai/stable-diffusion-xl-base-1.0',
+  'black-forest-labs/FLUX.1-dev'
+];
+
+async function tryImageModel(modelId, prompt, hfKey) {
+  try {
+    const r = await fetch('https://router.huggingface.co/hf-inference/models/' + modelId, {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + hfKey,
+        'Content-Type': 'application/json',
+        'x-wait-for-model': 'true'
+      },
+      body: JSON.stringify({
+        inputs: prompt,
+        parameters: { width: 1024, height: 1024 },
+        options: { wait_for_model: true }
+      })
+    });
+    if (!r.ok) return { ok: false, code: r.status, err: (await r.text()).slice(0, 200) };
+    const ct = r.headers.get('content-type') || '';
+    const buf = await r.buffer();
+    if (ct.includes('application/json')) {
+      try {
+        const j = JSON.parse(buf.toString('utf8'));
+        return { ok: false, code: 0, err: j.error || 'json-réponse' };
+      } catch (_) { return { ok: false, code: 0, err: 'json-invalide' }; }
+    }
+    const b64 = buf.toString('base64');
+    const mime = ct.includes('jpeg') ? 'image/jpeg' : 'image/png';
+    return { ok: true, url: `data:${mime};base64,${b64}` };
+  } catch (e) {
+    return { ok: false, code: 0, err: e.message };
+  }
+}
+
 app.post('/api/image', async (req, res) => {
   const { prompt } = req.body;
   if (!prompt) return res.status(400).json({ error: 'prompt requis' });
 
-  // Pollinations : URL générative pure - on retourne directement, le navigateur charge l'image
-  // (pas de HEAD check : Pollinations renvoie souvent 405 sur HEAD même quand GET marche)
-  const seed = Math.floor(Math.random() * 1e9);
-  const encoded = encodeURIComponent(prompt);
-  const url = `https://image.pollinations.ai/prompt/${encoded}?width=768&height=768&nologo=true&seed=${seed}`;
-  return res.json({ url });
-});
-
-// ---- MUSIC GENERATION (FIXED) ----
-app.post('/api/music', async (req, res) => {
-  // Accepte prompt, duration (secondes), style optionnel
-  const { prompt, duration = 30, style } = req.body;
-  if (!prompt) return res.status(400).json({ error: 'prompt requis' });
-
   const hfKey = process.env.HF_API_KEY || process.env.HUGGINGFACE_API_KEY;
-  if (!hfKey) {
-    return res.json({ error: 'Clé HuggingFace manquante. Ajoutez HF_API_KEY dans Render.' });
+  if (hfKey) {
+    for (const modelId of IMAGE_MODELS) {
+      console.log('[image] essai modèle :', modelId);
+      const r = await tryImageModel(modelId, prompt, hfKey);
+      if (r.ok) return res.json({ url: r.url });
+      // 401/403 : clé invalide, inutile d'essayer les autres
+      if (r.code === 401 || r.code === 403) break;
+    }
   }
 
-  // Clamp durée entre 5 et 30s (limite raisonnable pour l'API gratuite)
-  const dur = Math.min(30, Math.max(5, Number(duration) || 30));
+  // Dernier recours : Pollinations (souvent saturé, mais tentons)
+  const seed = Math.floor(Math.random() * 1e9);
+  const encoded = encodeURIComponent(prompt);
+  const fallbackUrl = `https://image.pollinations.ai/prompt/${encoded}?width=768&height=768&nologo=true&seed=${seed}`;
+  return res.json({ url: fallbackUrl });
+});
 
-  try {
-    const r = await fetch(
-      // URL CORRIGEE : .co et non .com
-      'https://api-inference.huggingface.co/models/facebook/musicgen-small',
-      {
+// ---- MUSIC GENERATION (multi-modèles avec fallback) ----
+// Liste des modèles essayés dans l'ordre. Si l'un est cassé/saturé, on tente le suivant.
+const MUSIC_MODELS = [
+  'facebook/musicgen-small',
+  'facebook/musicgen-stereo-small',
+  'facebook/musicgen-melody',
+  'facebook/musicgen-medium'
+];
+
+async function tryMusicModel(modelId, prompt, dur, hfKey) {
+  // Nouveau endpoint HF : api-inference a été supprimé du DNS
+  // On tente le router (nouveau) puis l'ancien au cas où
+  const urls = [
+    'https://router.huggingface.co/hf-inference/models/' + modelId,
+    'https://api-inference.huggingface.co/models/' + modelId
+  ];
+  let lastErr = { ok: false, code: 0, err: 'aucune tentative' };
+  for (const url of urls) {
+    try {
+      const r = await fetch(url, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${hfKey}`,
+          'Authorization': 'Bearer ' + hfKey,
           'Content-Type': 'application/json',
           'x-wait-for-model': 'true'
         },
         body: JSON.stringify({
           inputs: prompt,
           parameters: {
-            // MusicGen utilise max_new_tokens : ~50 tokens = ~1 seconde
-            // Pour 30 secondes : ~1500 tokens
             max_new_tokens: Math.round(dur * 50),
-            do_sample: true,
-            temperature: 1.0,
-            guidance_scale: 3
+            do_sample: true, temperature: 1.0, guidance_scale: 3
           },
           options: { wait_for_model: true }
-        }),
-        timeout: 120000
+        })
+      });
+      if (!r.ok) {
+        lastErr = { ok: false, code: r.status, err: (await r.text()).slice(0, 200) };
+        continue; // tente l'URL suivante
       }
-    );
-
-    if (!r.ok) {
-      const err = await r.text();
-      if (r.status === 503) {
-        return res.json({ error: 'Le modèle musical se réveille (60-90s). Réessayez dans un instant.' });
+      const ct = r.headers.get('content-type') || '';
+      const buf = await r.buffer();
+      if (ct.includes('application/json')) {
+        try {
+          const j = JSON.parse(buf.toString('utf8'));
+          lastErr = { ok: false, code: 0, err: j.error || 'json-réponse' };
+          continue;
+        } catch (_) {
+          lastErr = { ok: false, code: 0, err: 'json-invalide' };
+          continue;
+        }
       }
-      if (r.status === 401 || r.status === 403) {
-        return res.json({ error: 'Clé HuggingFace invalide. Vérifiez HF_API_KEY dans Render.' });
-      }
-      return res.json({ error: 'Erreur HuggingFace (' + r.status + '): ' + err.slice(0, 120) });
+      const b64 = buf.toString('base64');
+      const mime = ct.includes('flac') ? 'audio/flac' : 'audio/wav';
+      return { ok: true, url: `data:${mime};base64,${b64}` };
+    } catch (e) {
+      lastErr = { ok: false, code: 0, err: e.message };
+      // continue boucle pour essayer URL suivante
     }
-
-    const ct = r.headers.get('content-type') || '';
-    const buf = await r.buffer();
-
-    // HuggingFace renvoie un wav/flac binaire si OK, ou un JSON d'erreur si problème
-    if (ct.includes('application/json')) {
-      try {
-        const j = JSON.parse(buf.toString('utf8'));
-        return res.json({ error: j.error || 'Réponse inattendue du modèle.' });
-      } catch (_) {
-        return res.json({ error: 'Réponse inattendue du modèle.' });
-      }
-    }
-
-    const b64 = buf.toString('base64');
-    const mime = ct.includes('flac') ? 'audio/flac' : 'audio/wav';
-    res.json({ url: `data:${mime};base64,${b64}`, duration: dur, style: style || null });
-  } catch (e) {
-    res.json({ error: 'Erreur génération musicale: ' + (e.message || 'inconnue') });
   }
+  return lastErr;
+}
+
+app.post('/api/music', async (req, res) => {
+  const { prompt, duration = 30, style } = req.body;
+  if (!prompt) return res.status(400).json({ error: 'prompt requis' });
+
+  const hfKey = process.env.HF_API_KEY || process.env.HUGGINGFACE_API_KEY;
+  if (!hfKey) {
+    return res.json({ error: 'Service musique non configuré côté serveur.' });
+  }
+
+  const dur = Math.min(30, Math.max(5, Number(duration) || 30));
+
+  let lastErr = null;
+  let warmupSeen = false;
+  for (const modelId of MUSIC_MODELS) {
+    console.log('[music] essai modèle :', modelId);
+    const r = await tryMusicModel(modelId, prompt, dur, hfKey);
+    if (r.ok) {
+      return res.json({ url: r.url, duration: dur, style: style || null });
+    }
+    lastErr = r;
+    // Si c'est juste un warmup (503), on patiente plutôt que de switcher
+    if (r.code === 503) warmupSeen = true;
+    // 401/403 : la clé est invalide partout, inutile d'essayer les suivants
+    if (r.code === 401 || r.code === 403) {
+      return res.json({ error: 'Clé service musique invalide. Vérifiez la config Render.' });
+    }
+  }
+
+  // Message générique (pas de nom de provider) selon le type d'erreur
+  if (warmupSeen) {
+    return res.json({ error: 'Byte met un peu de temps à composer cette fois. Réessayez dans 30 secondes.' });
+  }
+  return res.json({
+    error: 'Byte ne peut pas composer pour l\'instant. Réessayez dans quelques minutes.'
+  });
 });
 
 // ---- VERIFICATION EMAIL PAR CODE (signup email seulement) ----
