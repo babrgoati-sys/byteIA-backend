@@ -222,16 +222,31 @@ Règles strictes :
 
   // VISION : si une image est jointe, routage forcé vers Gemini (seul provider vision)
   if (imageData && PROVIDERS.gemini && PROVIDERS.gemini.key) {
-    const geminiProvider = {
-      name: 'gemini',
-      tierKey: 'gemini:vision',
-      ...PROVIDERS.gemini,
-      model: 'gemini-2.0-flash'  // modèle vision rapide et gratuit
-    };
-    console.log('[chat] VISION mode → gemini');
-    const r = await tryProvider(geminiProvider, messages, res, imageData);
-    if (r.ok) return;
-    res.write(`data: ${JSON.stringify({ text: 'Désolé, l\'analyse d\'image n\'a pas marché. Réessayez.' })}\n\n`);
+    // Plusieurs modèles vision possibles selon disponibilité
+    const visionModels = [
+      'gemini-2.0-flash-exp',
+      'gemini-2.0-flash',
+      'gemini-1.5-flash-latest',
+      'gemini-1.5-flash',
+      'gemini-1.5-pro-latest'
+    ];
+    let lastErr = '';
+    for (const modelId of visionModels) {
+      const geminiProvider = {
+        name: 'gemini',
+        tierKey: 'gemini:vision:' + modelId,
+        ...PROVIDERS.gemini,
+        model: modelId
+      };
+      console.log('[chat] VISION mode → gemini model=' + modelId);
+      const r = await tryProvider(geminiProvider, messages, res, imageData);
+      if (r.ok) return;
+      lastErr = (r.err || '').slice(0, 150);
+      console.log('[vision] ' + modelId + ' a échoué : ' + lastErr);
+      // 401/403 : clé invalide partout, on arrête
+      if (r.code === 401 || r.code === 403) break;
+    }
+    res.write(`data: ${JSON.stringify({ text: 'Désolé, l\'analyse d\'image n\'a pas marché. Détail technique : ' + lastErr })}\n\n`);
     res.write('data: [DONE]\n\n');
     return res.end();
   }
